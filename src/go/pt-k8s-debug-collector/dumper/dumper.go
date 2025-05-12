@@ -28,18 +28,21 @@ type sslSecret struct {
 
 // Dumper struct is for dumping cluster
 type Dumper struct {
-	cmd           string
-	kubeconfig    string
-	resources     []string
-	filePaths     []string
-	fileContainer string
-	namespace     string
-	location      string
-	errors        string
-	mode          int64
-	crType        string
-	forwardport   string
-	sslSecrets    []sslSecret
+	cmd             string
+	kubeconfig      string
+	resources       []string
+	filePaths       []string
+	fileContainer   string
+	namespace       string
+	location        string
+	errors          string
+	mode            int64
+	crType          string
+	forwardport     string
+	sslSecrets       []sslSecret
+	// logPathPattern stores the glob pattern for PostgreSQL log files
+	// For PostgreSQL, this is set to "/pgdata/*/log/" to capture logs from all version directories
+	logPathPattern  string
 }
 
 var resourcesRe = regexp.MustCompile(`(\w+\.(\w+).percona\.com)`)
@@ -97,12 +100,18 @@ func New(location, namespace, resource string, kubeconfig string, forwardport st
 			"pgreplicas.pg.percona.com",
 			"pgtasks.pg.percona.com",
 		)
+		// Set log path pattern to capture logs from all PostgreSQL version directories
+		// This will match paths like /pgdata/pg12/log/, /pgdata/pg13/log/, etc.
+		d.logPathPattern = "/pgdata/*/log/"
 	case "pgv2":
 		resources = append(resources,
 			"perconapgbackups.pgv2.percona.com",
 			"perconapgclusters.pgv2.percona.com",
 			"perconapgrestores.pgv2.percona.com",
 		)
+		// Set log path pattern to capture logs from all PostgreSQL version directories
+		// This will match paths like /pgdata/pg12/log/, /pgdata/pg13/log/, etc.
+		d.logPathPattern = "/pgdata/*/log/"
 	case "pxc":
 		resources = append(resources,
 			"perconaxtradbclusterbackups.pxc.percona.com",
@@ -397,6 +406,40 @@ func (d *Dumper) DumpCluster() error {
 	err = d.getResource("nodes", "", false, tw)
 	if err != nil {
 		return errors.Wrapf(err, "get nodes")
+	}
+
+	// Get pods for additional PostgreSQL-specific data collection
+	pods, err := d.getPods(d.namespace)
+	if err != nil {
+		d.logError("Cannot get pods: %s", err.Error())
+	} else {
+		// Iterate through all pods to collect PostgreSQL-specific information
+		for _, pod := range pods.Items {
+			podName := pod.Name
+			
+			// Execute 'ps faux' command in the pod to get detailed process information
+			// This helps in debugging by showing all running processes and their relationships
+			psOutput, err := d.runCmd("exec", podName, "--", "ps", "faux")
+			if err != nil {
+				d.logError("Cannot execute ps faux for pod %s: %s", podName, err.Error())
+			} else {
+				// Save the ps faux output to a file in the archive
+				// The file will be named <podname>_ps_faux.txt
+				err = addToArchive(d.location+"/"+podName+"_ps_faux.txt", d.mode, psOutput, tw)
+				if err != nil {
+					d.logError("Cannot add ps faux output for pod %s to archive: %s", podName, err.Error())
+				}
+			}
+
+			// If logPathPattern is set (for PostgreSQL resources), collect log files
+			// This will gather all log files from the PostgreSQL data directory
+			if d.logPathPattern != "" {
+				err = d.getIndividualFiles(d.namespace, podName, d.logPathPattern, d.location+"/"+podName+"_logs", tw)
+				if err != nil {
+					d.logError("Cannot collect logs for pod %s: %s", podName, err.Error())
+				}
+			}
+		}
 	}
 
 	return nil
@@ -701,4 +744,18 @@ func resourceType(s string) string {
 		return "ps"
 	}
 	return s
+}
+
+func (d *Dumper) getPods(namespace string) (k8sPods, error) {
+	var pods k8sPods
+	args := []string{"get", "pods", "-o", "json", "--namespace", namespace}
+	output, err := d.runCmd(args...)
+	if err != nil {
+		return pods, errors.Wrap(err, "get pods")
+	}
+	err = json.Unmarshal(output, &pods)
+	if err != nil {
+		return pods, errors.Wrap(err, "unmarshal pods")
+	}
+	return pods, nil
 }
