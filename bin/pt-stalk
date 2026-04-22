@@ -803,6 +803,7 @@ CMD_IOSTAT="${CMD_IOSTAT:-"$(_which iostat)"}"
 CMD_MPSTAT="${CMD_MPSTAT:-"$(_which mpstat)"}"
 CMD_MYSQL="${CMD_MYSQL:-"$(_which mysql)"}"
 CMD_MYSQLADMIN="${CMD_MYSQLADMIN:-"$(_which mysqladmin)"}"
+CMD_PSQL="${CMD_PSQL:-"$(_which psql)"}"
 CMD_OPCONTROL="${CMD_OPCONTROL:-"$(_which opcontrol)"}"
 [ -z "$CMD_OPCONTROL" ] && CMD_OPCONTROL=$(_which operf)
 CMD_OPREPORT="${CMD_OPREPORT:-"$(_which opreport)"}"
@@ -822,19 +823,23 @@ collect() {
    local cnt=$(($OPT_RUN_TIME / $OPT_SLEEP_COLLECT))
 
    if [ ! "$OPT_SYSTEM_ONLY" ]; then
-      local mysqld_pid=""
-      local mysql_version=""
-      local mysql_error_log=""
-      local tail_error_log_pid=""
-      local have_lock_waits_table=""
-      local lock_table_p_s=""
-      local have_oprofile=""
-      local mysqladmin_pid=""
-      local mutex=""
-      local tcpdump_pid=""
-      local ps_instrumentation_enabled=""
+      if [ "${OPT_PGSQL:-}" ]; then
+         collect_pgsql_data_one
+      else
+         local mysqld_pid=""
+         local mysql_version=""
+         local mysql_error_log=""
+         local tail_error_log_pid=""
+         local have_lock_waits_table=""
+         local lock_table_p_s=""
+         local have_oprofile=""
+         local mysqladmin_pid=""
+         local mutex=""
+         local tcpdump_pid=""
+         local ps_instrumentation_enabled=""
 
-      collect_mysql_data_one
+         collect_mysql_data_one
+      fi
    fi
 
    if [ ! "$OPT_MYSQL_ONLY" ]; then
@@ -851,7 +856,7 @@ collect() {
          collect_system_data_loop
       fi
 
-      if [ ! "$OPT_SYSTEM_ONLY" ]; then
+      if [ ! "$OPT_SYSTEM_ONLY" ] && [ -z "${OPT_PGSQL:-}" ]; then
          collect_mysql_data_loop
       fi
 
@@ -859,7 +864,7 @@ collect() {
    done
    log "Loop end: $(date +'TS %s.%N %F %T')"
 
-   if [ ! "$OPT_SYSTEM_ONLY" ]; then
+   if [ ! "$OPT_SYSTEM_ONLY" ] && [ -z "${OPT_PGSQL:-}" ]; then
       collect_mysql_data_two
    fi
 
@@ -1381,6 +1386,49 @@ collect_mysql_variables() {
       $CMD_MYSQL $EXT_ARGV -e "$sql" >> $outfile
    fi
 
+}
+
+pgsql_env() {
+   local prefix=""
+   [ -n "${OPT_PG_HOST:-}" ]     && prefix="$prefix PGHOST='${OPT_PG_HOST}'"
+   [ -n "${OPT_PG_PORT:-}" ]     && prefix="$prefix PGPORT='${OPT_PG_PORT}'"
+   [ -n "${OPT_PG_USER:-}" ]     && prefix="$prefix PGUSER='${OPT_PG_USER}'"
+   [ -n "${OPT_PG_DATABASE:-}" ] && prefix="$prefix PGDATABASE='${OPT_PG_DATABASE}'"
+   [ -n "${OPT_PG_SERVICE:-}" ]  && prefix="$prefix PGSERVICE='${OPT_PG_SERVICE}'"
+   [ -n "${OPT_PG_PASSWORD:-}" ] && prefix="$prefix PGPASSWORD='${OPT_PG_PASSWORD}'"
+   echo "$prefix"
+}
+
+collect_pgsql_data_one() {
+   local flag_file="$OPT_DEST/pg_gather.running"
+   local outfile="$d/$p-pg-gather.tsv"
+   [ "${OPT_PG_GZIP:-}" ] && outfile="${outfile}.gz"
+
+   if [ -f "$flag_file" ]; then
+      local prev_pid="$(cat "$flag_file" 2>/dev/null)"
+      if [ -n "$prev_pid" ] && kill -0 "$prev_pid" 2>/dev/null; then
+         local skip_msg="pg_gather from a previous iteration (PID $prev_pid) is still running; skipping pg_gather for this iteration"
+         warn "$skip_msg"
+         ts "$skip_msg" >> "$outfile"
+         return 0
+      else
+         rm -f "$flag_file"
+      fi
+   fi
+
+   local env_prefix
+   env_prefix="$(pgsql_env)"
+   local psql_bin="${OPT_PG_PSQL:-$CMD_PSQL}"
+   log "Running pg_gather ($OPT_PG_GATHER_SQL) -> $outfile"
+   (
+      if [ "${OPT_PG_GZIP:-}" ]; then
+         eval "$env_prefix \"$psql_bin\" -X -f \"$OPT_PG_GATHER_SQL\"" | gzip > "$outfile"
+      else
+         eval "$env_prefix \"$psql_bin\" -X -f \"$OPT_PG_GATHER_SQL\"" > "$outfile"
+      fi
+      rm -f "$flag_file"
+   ) &
+   echo "$!" > "$flag_file"
 }
 
 _should_skip() {
