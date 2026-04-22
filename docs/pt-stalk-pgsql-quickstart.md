@@ -13,13 +13,13 @@ build** — just download and run.
 
 ```bash
 # 1. pt-stalk from the pt-stalk-pgsql branch
-sudo curl -fsSL -o /usr/local/bin/pt-stalk \
+curl -fsSL -o /usr/local/bin/pt-stalk \
    https://raw.githubusercontent.com/guriandoro/percona-toolkit/pt-stalk-pgsql/bin/pt-stalk
-sudo chmod +x /usr/local/bin/pt-stalk
+chmod +x /usr/local/bin/pt-stalk
 
 # 2. gather.sql from pg_gather (one of pt-stalk's default search paths)
-sudo mkdir -p /usr/local/share/pt-stalk
-sudo curl -fsSL -o /usr/local/share/pt-stalk/gather.sql \
+mkdir -p /usr/local/share/pt-stalk
+curl -fsSL -o /usr/local/share/pt-stalk/gather.sql \
    https://raw.githubusercontent.com/jobinau/pg_gather/main/gather.sql
 ```
 
@@ -35,8 +35,8 @@ which psql && psql --version
 ## Smoke-test against a live PostgreSQL
 
 ```bash
-sudo mkdir -p /var/lib/pt-stalk
-sudo pt-stalk \
+mkdir -p /var/lib/pt-stalk
+pt-stalk \
    --pgsql --no-stalk --collect --iterations 1 \
    --run-time 30 \
    --pg-host 127.0.0.1 --pg-user postgres --pg-database postgres \
@@ -45,9 +45,9 @@ sudo pt-stalk \
    --pid /tmp/pt-stalk.pid --log /tmp/pt-stalk.log
 
 # inspect results
-sudo ls /var/lib/pt-stalk
-sudo zcat /var/lib/pt-stalk/*/*-pg-gather.tsv.gz | head
-sudo cat /tmp/pt-stalk.log
+ls /var/lib/pt-stalk
+zcat /var/lib/pt-stalk/*/*-pg-gather.tsv.gz | head
+cat /tmp/pt-stalk.log
 ```
 
 ## Updating later
@@ -58,6 +58,6 @@ specific commit instead of the branch tip, swap the branch name for
 the SHA, e.g.:
 
 ```bash
-sudo curl -fsSL -o /usr/local/bin/pt-stalk \
+curl -fsSL -o /usr/local/bin/pt-stalk \
    https://raw.githubusercontent.com/guriandoro/percona-toolkit/800984ee/bin/pt-stalk
 ```
