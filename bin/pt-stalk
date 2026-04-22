@@ -1546,6 +1546,12 @@ set_trg_func() {
       if [ "$func" = "status" -o "$func" = "processlist" ]; then
          TRIGGER_FUNCTION="trg_$func"
          return 0  # success
+      elif [ "$func" = "pg-activity" ]; then
+         TRIGGER_FUNCTION="trg_pg_activity"
+         return 0  # success
+      elif [ "$func" = "pg-waiting" ]; then
+         TRIGGER_FUNCTION="trg_pg_waiting"
+         return 0  # success
       fi
    fi
    return 1  # error
@@ -1565,6 +1571,18 @@ trg_processlist() {
    grep_processlist "$tmpfile-1" "$var" "$OPT_MATCH" 0 0 > "$tmpfile-2"
    wc -l "$tmpfile-2" | awk '{print $1}'
    rm -f "$tmpfile"*
+}
+
+trg_pg_activity() {
+   local var="$1"
+   local psql_bin="${OPT_PG_PSQL:-$CMD_PSQL}"
+   eval "$(pgsql_env) \"$psql_bin\" -X -Atq -c \"SELECT count(*) FROM pg_stat_activity WHERE state = 'active';\""
+}
+
+trg_pg_waiting() {
+   local var="$1"
+   local psql_bin="${OPT_PG_PSQL:-$CMD_PSQL}"
+   eval "$(pgsql_env) \"$psql_bin\" -X -Atq -c \"SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND wait_event IS NOT NULL;\""
 }
 
 oktorun() {
@@ -1799,7 +1817,7 @@ main() {
    # Note: $$ is the parent's PID, but we're a child proc.
    # Bash 4 has $BASHPID but we can't rely on that.  Consequently,
    # we don't know our own PID.  See the usage of $! below.
-   RAN_WITH="--function=$OPT_FUNCTION --variable=$OPT_VARIABLE --threshold=$OPT_THRESHOLD --match=$OPT_MATCH --cycles=$OPT_CYCLES --interval=$OPT_INTERVAL --iterations=$OPT_ITERATIONS --run-time=$OPT_RUN_TIME --sleep=$OPT_SLEEP --dest=$OPT_DEST --prefix=$OPT_PREFIX --notify-by-email=$OPT_NOTIFY_BY_EMAIL --log=$OPT_LOG --pid=$OPT_PID --plugin=$OPT_PLUGIN"
+   RAN_WITH="--function=$OPT_FUNCTION --variable=$OPT_VARIABLE --threshold=$OPT_THRESHOLD --match=$OPT_MATCH --cycles=$OPT_CYCLES --interval=$OPT_INTERVAL --iterations=$OPT_ITERATIONS --run-time=$OPT_RUN_TIME --sleep=$OPT_SLEEP --dest=$OPT_DEST --prefix=$OPT_PREFIX --notify-by-email=$OPT_NOTIFY_BY_EMAIL --log=$OPT_LOG --pid=$OPT_PID --plugin=$OPT_PLUGIN --pgsql=${OPT_PGSQL:-no} --pg-host=${OPT_PG_HOST:-} --pg-port=${OPT_PG_PORT:-} --pg-user=${OPT_PG_USER:-} --pg-database=${OPT_PG_DATABASE:-} --pg-service=${OPT_PG_SERVICE:-} --pg-gather-sql=${OPT_PG_GATHER_SQL:-} --pg-gzip=${OPT_PG_GZIP:-no}"
 
    log "Starting $0 $RAN_WITH"
 
@@ -1843,9 +1861,43 @@ if    [ "${0##*/}" = "$TOOL" ] \
       log 'Both options --system-only and --mysql-only specified, collecting only disk-space, hostname, output, and trigger metrics';
    fi
 
+   if [ "$OPT_PGSQL" ] && [ "$OPT_MYSQL_ONLY" ]; then
+      option_error "--pgsql and --mysql-only are mutually exclusive"
+   fi
+
+   if [ "$OPT_PGSQL" ] && [ "$OPT_RUN_TIME" -lt 30 ]; then
+      option_error "--pgsql requires --run-time to be at least 30 seconds (pg_gather contains internal sleeps that can take more than 20 seconds); current --run-time is $OPT_RUN_TIME"
+   fi
+
+   if [ "$OPT_PGSQL" ]; then
+      # Resolve --pg-gather-sql, falling back to a fixed search list.
+      if [ -z "$OPT_PG_GATHER_SQL" ]; then
+         for candidate in \
+            "/usr/share/pt-stalk/gather.sql" \
+            "/usr/local/share/pt-stalk/gather.sql" \
+            "$(dirname "$0")/../share/pt-stalk/gather.sql" \
+            "$PWD/gather.sql"; do
+            if [ -f "$candidate" ]; then
+               OPT_PG_GATHER_SQL="$candidate"
+               break
+            fi
+         done
+      fi
+      if [ -z "$OPT_PG_GATHER_SQL" ] || [ ! -f "$OPT_PG_GATHER_SQL" ]; then
+         option_error "--pgsql requires gather.sql; provide it via --pg-gather-sql or place it at one of the default search paths (see --help)"
+      fi
+   fi
+
    # Verify and set TRIGGER_FUNCTION based on --function.
    if ! set_trg_func "$OPT_FUNCTION"; then
       option_error "Invalid --function value: $OPT_FUNCTION"
+   fi
+
+   # PG-specific built-in trigger functions only make sense in --pgsql mode.
+   if [ "$OPT_FUNCTION" = "pg-activity" ] || [ "$OPT_FUNCTION" = "pg-waiting" ]; then
+      if [ -z "$OPT_PGSQL" ]; then
+         option_error "--function=$OPT_FUNCTION requires --pgsql"
+      fi
    fi
 
    # Verify and source the --plugin.
@@ -1883,36 +1935,60 @@ if    [ "${0##*/}" = "$TOOL" ] \
       exit 0
    fi
 
-   # if ASK-PASS , request password on terminal without echoing. This will override --password
-   if [ -n "$OPT_ASK_PASS" ]; then
-      stty_orig=`stty -g`           # save original terminal setting.
-      echo -n "Enter MySQL password: ";
-      stty -echo                    # turn-off echoing.
-      read OPT_PASSWORD             # read the password
-      stty $stty_orig               # restore terminal setting.
-   fi
+   if [ "$OPT_PGSQL" ]; then
+      # PostgreSQL ask-pass: prompt for password and feed it via PGPASSWORD.
+      if [ -n "$OPT_PG_ASK_PASS" ]; then
+         stty_orig=`stty -g`
+         echo -n "Enter PostgreSQL password: ";
+         stty -echo
+         read OPT_PG_PASSWORD
+         stty $stty_orig
+         printf "\n"
+      fi
 
-   MYSQL_ARGS="$(mysql_options)"
-   EXT_ARGV="$(arrange_mysql_options "$EXT_ARGV $MYSQL_ARGS")"
+      if [ -n "$OPT_PG_PASSWORD" ] && [ -z "$OPT_PG_ASK_PASS" ]; then
+         log 'Providing the PostgreSQL password via --pg-password is insecure. Prefer a .pgpass file or the --pg-ask-pass option.';
+      fi
 
-   # Test if MySQL password provided on command line; warn if so.
-   if [ -n "$OPT_PASSWORD" ] || $(echo "$EXT_ARGV" | grep -qP "(\-\-password=)|((^|\s)+\-p[^\s]+)"); then
-      log 'Providing MySQL password on the command line interface is insecure. It will be visible in the operating system process list and stored in the collected output of the ps command. Consider using a configuration file or the --ask-pass option instead.';
-   fi
+      if [ ! "$OPT_SYSTEM_ONLY" ]; then
+         psql_bin="${OPT_PG_PSQL:-$CMD_PSQL}"
+         [ -n "$psql_bin" ] && [ -n "$($psql_bin --version 2>/dev/null)" ] \
+            || die "Cannot execute psql ($psql_bin). Check that it is in PATH or set --pg-psql."
+         eval "$(pgsql_env) \"$psql_bin\" -X -tAc 'SELECT 1'" >/dev/null \
+            || die "Cannot connect to PostgreSQL. Check the --pg-* options or libpq env vars."
+      fi
+   else
+      # if ASK-PASS , request password on terminal without echoing. This will override --password
+      if [ -n "$OPT_ASK_PASS" ]; then
+         stty_orig=`stty -g`           # save original terminal setting.
+         echo -n "Enter MySQL password: ";
+         stty -echo                    # turn-off echoing.
+         read OPT_PASSWORD             # read the password
+         stty $stty_orig               # restore terminal setting.
+      fi
 
-   if [ ! "$OPT_SYSTEM_ONLY" ]; then
-      # Check that mysql and mysqladmin are in PATH.  If not, we're
-      # already dead in the water, so don't bother with cmd line opts,
-      # just error and exit.
-      [ -n "$(mysql --help)" ] \
-         || die "Cannot execute mysql.  Check that it is in PATH."
-      [ -n "$(mysqladmin --help)" ] \
-         || die "Cannot execute mysqladmin.  Check that it is in PATH."
+      MYSQL_ARGS="$(mysql_options)"
+      EXT_ARGV="$(arrange_mysql_options "$EXT_ARGV $MYSQL_ARGS")"
 
-      # Now that we have the cmd line opts, check that we can actually
-      # connect to MySQL.
-      [ -n "$(mysql $EXT_ARGV -e 'SELECT 1')" ] \
-         || die "Cannot connect to MySQL.  Check that MySQL is running and that the options after -- are correct."
+      # Test if MySQL password provided on command line; warn if so.
+      if [ -n "$OPT_PASSWORD" ] || $(echo "$EXT_ARGV" | grep -qP "(\-\-password=)|((^|\s)+\-p[^\s]+)"); then
+         log 'Providing MySQL password on the command line interface is insecure. It will be visible in the operating system process list and stored in the collected output of the ps command. Consider using a configuration file or the --ask-pass option instead.';
+      fi
+
+      if [ ! "$OPT_SYSTEM_ONLY" ]; then
+         # Check that mysql and mysqladmin are in PATH.  If not, we're
+         # already dead in the water, so don't bother with cmd line opts,
+         # just error and exit.
+         [ -n "$(mysql --help)" ] \
+            || die "Cannot execute mysql.  Check that it is in PATH."
+         [ -n "$(mysqladmin --help)" ] \
+            || die "Cannot execute mysqladmin.  Check that it is in PATH."
+
+         # Now that we have the cmd line opts, check that we can actually
+         # connect to MySQL.
+         [ -n "$(mysql $EXT_ARGV -e 'SELECT 1')" ] \
+            || die "Cannot connect to MySQL.  Check that MySQL is running and that the options after -- are correct."
+      fi
    fi
 
    # Check existence and access to the --dest dir if we're collecting.
@@ -2076,6 +2152,28 @@ The diagnostic data is written to files whose names begin with a timestamp, so
 you can distinguish samples from each other in case the tool collects data
 multiple times.  The pt-sift tool is designed to help you browse and analyze
 the resulting data samples.
+
+=head2 PostgreSQL mode
+
+When invoked with L<"--pgsql">, pt-stalk targets PostgreSQL instead of
+MySQL. In this mode, no MySQL collectors run; instead, each triggered
+iteration starts by running pg_gather's C<gather.sql>
+(L<https://github.com/jobinau/pg_gather>) once via C<psql>, capturing its
+output to F<E<lt>prefixE<gt>-pg-gather.tsv[.gz]>. The system-data loop
+(C<vmstat>, C<iostat>, C<df>, C</proc> snapshots, etc.) is unchanged.
+
+Because C<gather.sql> sleeps internally for more than 20 seconds,
+pt-stalk requires L<"--run-time"> to be at least 30 in PostgreSQL mode.
+If a previous iteration's pg_gather is still running when the next one
+starts, pt-stalk skips the new C<psql> invocation and writes a warning
+into the would-be output file rather than starting a duplicate run.
+
+PostgreSQL connection options are L<"--pg-host">, L<"--pg-port">,
+L<"--pg-user">, L<"--pg-database">, L<"--pg-service">, L<"--pg-password">,
+and L<"--pg-ask-pass">. Any unset value falls through to the standard
+libpq environment variables (C<PGHOST>, C<PGPORT>, etc.) and to
+F<.pgpass> / F<pg_service.conf>. Built-in trigger functions
+C<pg-activity> and C<pg-waiting> are available via L<"--function">.
 
 Although this sounds simple enough, in practice there are a number of
 subtleties, such as detecting when the disk is beginning to fill up so that the
@@ -2245,6 +2343,23 @@ L<"--match"> option.  For example, to trigger L<"--collect"> when more than
    --match statistics     \
    --threshold 10
 
+=item * pg-activity
+
+Only valid with L<"--pgsql">. Watches C<pg_stat_activity> and uses the count
+of backends in C<state = 'active'> as the trigger value. L<"--variable"> is
+ignored. For example, to trigger when more than 50 active queries are
+running:
+
+   --pgsql --function pg-activity --threshold 50
+
+=item * pg-waiting
+
+Only valid with L<"--pgsql">. Watches C<pg_stat_activity> and uses the count
+of active backends with a non-NULL C<wait_event> (i.e. blocked or otherwise
+waiting) as the trigger value. L<"--variable"> is ignored. For example:
+
+   --pgsql --function pg-waiting --threshold 5
+
 =back
 
 In addition, you can specify a file that contains your custom trigger
@@ -2326,6 +2441,124 @@ If password contains commas they must be escaped with a backslash: "exam\,ple"
 B<WARNING>: Providing the password on the command line is insecure. The password will
 be visible to all users on the system and will be stored in the collected output of
 the C<"ps"> command. Use a MySQL option file or the L<"--ask-pass"> option instead.
+
+=item --pg-ask-pass
+
+Prompt for a PostgreSQL password in L<"--pgsql"> mode. The password is
+exported as C<PGPASSWORD> for C<psql>.
+
+=item --pg-database
+
+type: string; default: postgres
+
+PostgreSQL database to connect to in L<"--pgsql"> mode. Equivalent to setting
+the C<PGDATABASE> environment variable for C<psql>.
+
+=item --pg-gather-sql
+
+type: string
+
+Path to the C<gather.sql> script from the pg_gather project
+(L<https://github.com/jobinau/pg_gather>) to run on each L<"--pgsql">
+collection. If not given, the tool searches in this order and uses the first
+file that exists:
+
+=over
+
+=item * /usr/share/pt-stalk/gather.sql
+
+=item * /usr/local/share/pt-stalk/gather.sql
+
+=item * F<E<lt>tool dirE<gt>/../share/pt-stalk/gather.sql>
+
+=item * F<./gather.sql>
+
+=back
+
+If no file is found, pt-stalk exits with an error in L<"--pgsql"> mode.
+
+=item --pg-gzip
+
+default: yes; negatable: yes
+
+Pipe the C<gather.sql> output through C<gzip>, producing
+F<E<lt>prefixE<gt>-pg-gather.tsv.gz>. Specify C<--no-pg-gzip> to keep the raw
+TSV file F<E<lt>prefixE<gt>-pg-gather.tsv> instead.
+
+=item --pg-host
+
+type: string
+
+PostgreSQL host to connect to in L<"--pgsql"> mode. Equivalent to setting the
+C<PGHOST> environment variable for C<psql>.
+
+=item --pg-password
+
+type: string
+
+PostgreSQL password used in L<"--pgsql"> mode. Equivalent to setting the
+C<PGPASSWORD> environment variable for C<psql>.
+
+B<WARNING>: Providing the password on the command line is insecure. Prefer a
+F<.pgpass> file (L<https://www.postgresql.org/docs/current/libpq-pgpass.html>)
+or the L<"--pg-ask-pass"> option.
+
+=item --pg-port
+
+type: int; default: 5432
+
+PostgreSQL port to connect to in L<"--pgsql"> mode. Equivalent to setting the
+C<PGPORT> environment variable for C<psql>.
+
+=item --pg-psql
+
+type: string
+
+Path to the C<psql> binary used in L<"--pgsql"> mode. Defaults to whatever the
+tool finds on C<PATH>. Mirrors the C<CMD_*> environment-variable pattern used
+for C<mysql> (see L<"ENVIRONMENT">).
+
+=item --pg-service
+
+type: string
+
+PostgreSQL service name (from F<pg_service.conf>) to use in L<"--pgsql"> mode.
+Equivalent to setting the C<PGSERVICE> environment variable for C<psql>.
+
+=item --pg-user
+
+type: string
+
+PostgreSQL user to connect as in L<"--pgsql"> mode. Equivalent to setting the
+C<PGUSER> environment variable for C<psql>.
+
+=item --pgsql
+
+Switch pt-stalk to PostgreSQL mode. Instead of running the MySQL collectors,
+each triggered iteration starts by running the pg_gather C<gather.sql>
+script (see L<"--pg-gather-sql">) once, capturing its output to
+F<E<lt>prefixE<gt>-pg-gather.tsv[.gz]>. The system-data loop still runs.
+
+When this option is set:
+
+=over
+
+=item * L<"--mysql-only"> is rejected as incompatible.
+
+=item * L<"--run-time"> must be at least 30, because C<gather.sql> contains
+internal sleeps that can take more than 20 seconds.
+
+=item * If a pg_gather started by a previous iteration is still running when
+the next iteration starts, pt-stalk skips the new C<psql> invocation and
+writes a warning into F<E<lt>prefixE<gt>-pg-gather.tsv[.gz]>.
+
+=back
+
+PostgreSQL connection parameters can be provided via the L<"--pg-host">,
+L<"--pg-port">, L<"--pg-user">, L<"--pg-database">, L<"--pg-service">,
+L<"--pg-password">, and L<"--pg-ask-pass"> options. Any unset value falls
+through to the standard libpq environment variables (C<PGHOST>, C<PGPORT>,
+etc.) so existing F<.pgpass> / F<pg_service.conf> setups work transparently.
 
 =item --pid
 
@@ -2593,6 +2826,8 @@ Specifically, the variables that can be set are:
 
 =item CMD_PMAP
 
+=item CMD_PSQL
+
 =item CMD_STRACE
 
 =item CMD_SYSCTL
@@ -2629,6 +2864,11 @@ This tool requires Bash v3 or newer.  Certain options require other programs:
 =item L<"--collect-strace"> requires C<strace>
 
 =item L<"--collect-tcpdump"> requires C<tcpdump>
+
+=item L<"--pgsql"> requires C<psql> (the PostgreSQL command-line client) and
+the C<gather.sql> script from the pg_gather project
+(L<https://github.com/jobinau/pg_gather>). See L<"--pg-gather-sql"> for the
+default search paths.
 
 =back
 
