@@ -1,5 +1,9 @@
 Changelog for Percona Toolkit
 
+Unreleased
+
+* Feature: pt-stalk now supports PostgreSQL collection via --pgsql, which runs pg_gather (https://github.com/jobinau/pg_gather) gather.sql once at the start of each iteration. New options: --pgsql, --pg-host, --pg-port, --pg-user, --pg-database, --pg-password, --pg-ask-pass, --pg-service, --pg-gather-sql, --pg-psql, --pg-gzip. New built-in --function values: pg-activity, pg-waiting. --pgsql requires --run-time >= 30 (pg_gather contains internal sleeps); a still-running pg_gather from a previous iteration causes the next one to be skipped with a warning.
+
 v3.7.1 released 2025-12-17
 
 * Feature PT-2453: Add -skip-pod-summary for pt-k8s-debug-collector (Thanks to Iwo Panowicz for the contribution)
