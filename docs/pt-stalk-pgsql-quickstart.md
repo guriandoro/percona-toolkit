@@ -37,8 +37,8 @@ which psql && psql --version
 ```bash
 mkdir -p /var/lib/pt-stalk
 pt-stalk \
-   --pgsql --no-stalk --collect --iterations 1 \
-   --run-time 30 \
+   --pgsql --no-stalk --collect --iterations 2 \
+   --run-time 30 --sleep 30 \
    --pg-host 127.0.0.1 --pg-user postgres --pg-database postgres \
    --pg-ask-pass \
    --dest /var/lib/pt-stalk \
